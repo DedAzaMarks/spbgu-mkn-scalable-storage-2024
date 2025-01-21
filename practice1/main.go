@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -28,7 +29,6 @@ func init() {
 	geojson.CustomJSONUnmarshaler = c
 }
 
-// Router реализует перенаправление HTTP запросов
 type Router struct {
 	mux   *http.ServeMux
 	nodes [][]string
@@ -59,21 +59,22 @@ func (r *Router) Stop() {
 	slog.Info("Router stopped")
 }
 
-// Storage управляет сохранением GeoJSON объектов
 type Storage struct {
-	mux    *http.ServeMux
-	name   string
-	geoDB  map[string]*geojson.Feature
-	mutex  sync.RWMutex
-	dbFile string
+	mux      *http.ServeMux
+	name     string
+	geoCache map[string]*geojson.Feature
+	geoDB    *geojson.FeatureCollection
+	mutex    sync.RWMutex
+	dbFile   string
 }
 
 func NewStorage(mux *http.ServeMux, name string, dbFile string) *Storage {
 	storage := &Storage{
-		mux:    mux,
-		name:   name,
-		geoDB:  make(map[string]*geojson.Feature),
-		dbFile: dbFile,
+		mux:      mux,
+		name:     name,
+		geoCache: make(map[string]*geojson.Feature),
+		geoDB:    geojson.NewFeatureCollection(),
+		dbFile:   dbFile,
 	}
 
 	mux.HandleFunc("/"+name+"/insert", storage.insertHandler)
@@ -97,7 +98,7 @@ func (s *Storage) Stop() {
 func (s *Storage) loadFromFile() {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	file, err := os.Open(s.dbFile)
+	data, err := os.ReadFile(s.dbFile)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return
@@ -105,10 +106,14 @@ func (s *Storage) loadFromFile() {
 		slog.Error("Failed to load DB", "err", err)
 		return
 	}
-	defer file.Close()
-	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(&s.geoDB); err != nil {
-		slog.Error("Failed to decode DB", "err", err)
+	col, err := geojson.UnmarshalFeatureCollection(data)
+	if err != nil {
+		slog.Error("Failed to unmarshal DB", "err", err)
+	}
+	s.geoDB = col
+	s.geoCache = make(map[string]*geojson.Feature, len(col.Features))
+	for _, feature := range col.Features {
+		s.geoCache[feature.ID.(string)] = feature
 	}
 }
 
@@ -121,16 +126,16 @@ func (s *Storage) saveToFile() {
 		return
 	}
 	defer file.Close()
-	encoder := json.NewEncoder(file)
-	for _, f := range s.geoDB {
-		f.MarshalJSON()
-	}
-	if err := encoder.Encode(s.geoDB); err != nil {
+	buf, err := s.geoDB.MarshalJSON()
+	if err != nil {
 		slog.Error("Failed to encode DB", "err", err)
+	}
+	if _, err = file.Write(buf); err != nil {
+		slog.Error("Failed to write to file", "err", err)
 	}
 }
 
-func checkID(w http.ResponseWriter, feature *geojson.Feature) (string, bool) {
+func hasID(w http.ResponseWriter, feature *geojson.Feature) (string, bool) {
 	id, ok := feature.ID.(string)
 	if !ok {
 		slog.Error("ID is wrong type, string expected")
@@ -142,6 +147,7 @@ func checkID(w http.ResponseWriter, feature *geojson.Feature) (string, bool) {
 }
 
 func (s *Storage) insertHandler(w http.ResponseWriter, r *http.Request) {
+	slog.Info("insert method")
 	buf, err := io.ReadAll(r.Body)
 	defer r.Body.Close()
 	if err != nil {
@@ -154,15 +160,21 @@ func (s *Storage) insertHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	id, ok := checkID(w, feature)
+	id, ok := hasID(w, feature)
 	if !ok {
+		//fixme
 		return
 	}
-	s.geoDB[id] = feature
+	if _, ok := s.geoCache[id]; ok {
+		return
+	}
+	s.geoCache[id] = feature
+	s.geoDB.Append(feature)
 	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Storage) replaceHandler(w http.ResponseWriter, r *http.Request) {
+	slog.Info("replace method")
 	buf, err := io.ReadAll(r.Body)
 	defer r.Body.Close()
 	if err != nil {
@@ -175,19 +187,30 @@ func (s *Storage) replaceHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	id, ok := checkID(w, feature)
+	id, ok := hasID(w, feature)
 	if !ok {
 		return
 	}
-	if _, exists := s.geoDB[id]; !exists {
+	if _, exists := s.geoCache[id]; !exists {
 		http.Error(w, "feature not found", http.StatusNotFound)
 		return
 	}
-	s.geoDB[id] = feature
+	s.geoCache[id] = feature
+	i := slices.IndexFunc(s.geoDB.Features, func(f *geojson.Feature) bool {
+		return f.ID == id
+	})
+	if i == -1 {
+		slog.Error("id %s couldn't be found in db", slog.String("point-id", id))
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}
+	s.geoDB.Features[i] = s.geoDB.Features[len(s.geoDB.Features)-1]
+	s.geoDB.Features = s.geoDB.Features[:len(s.geoDB.Features)-1]
+	s.geoDB.Append(feature)
 	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Storage) deleteHandler(w http.ResponseWriter, r *http.Request) {
+	slog.Info("delete method")
 	var data struct {
 		ID string `json:"id"`
 	}
@@ -197,25 +220,37 @@ func (s *Storage) deleteHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	delete(s.geoDB, data.ID)
+	delete(s.geoCache, data.ID)
+	i := slices.IndexFunc(s.geoDB.Features, func(f *geojson.Feature) bool {
+		return f.ID == data.ID
+	})
+	if i == -1 {
+		slog.Error("id %s couldn't be found in db", slog.String("point-id", data.ID))
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}
+	// order is insignificant
+	s.geoDB.Features[i] = s.geoDB.Features[len(s.geoDB.Features)-1]
+	s.geoDB.Features = s.geoDB.Features[:len(s.geoDB.Features)-1]
 	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Storage) selectHandler(w http.ResponseWriter, r *http.Request) {
+	slog.Info("select method")
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
-	collection := geojson.NewFeatureCollection()
-	for _, feature := range s.geoDB {
-		collection.Append(feature)
+	data, err := s.geoDB.MarshalJSON()
+	if err != nil {
+		slog.Error("can't marshal db", slog.String("error", err.Error()))
 	}
+	slog.Debug(string(data))
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(collection)
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
 }
 
 func main() {
 	mux := http.NewServeMux()
 
-	// Создаем компоненты
 	storage := NewStorage(mux, "storage", "geo.db.json")
 	router := NewRouter(mux, [][]string{{"storage"}})
 
@@ -227,7 +262,6 @@ func main() {
 		Handler: mux,
 	}
 
-	// Завершаем сервер по сигналу
 	go func() {
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
